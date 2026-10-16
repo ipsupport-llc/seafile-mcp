@@ -197,7 +197,8 @@ function coerce(v, spec, key, strict) {
       return items.map(function (x, i) { return coerce(x, { type: 'id' }, key + '[' + i + ']', strict); });
     }
     case 'list': {
-      var names = (Array.isArray(v) ? v.map(String) : toList(v)).map(trim).filter(Boolean);
+      // a single string is one item: "/a,b.txt" is a file name, not two targets (pass an array for several)
+      var names = (Array.isArray(v) ? v.map(String) : [String(v)]).map(trim).filter(Boolean);
       if (!names.length) bad('a non-empty list (leave it out instead)'); // an empty selector must not mean "all"
       return names;
     }
@@ -236,7 +237,7 @@ function normaliseArgs(raw, specs, path, strict) {
   var out = {}, src = {}, unknown = [];
   Object.keys(raw).forEach(function (k) {
     var v = raw[k];
-    if (v === null || v === undefined || v === '') return;
+    if (v === null || v === undefined || (v === '' && !(specs[k] && specs[k].raw))) return;
     var key = specs[k] ? k : snake(k);
     if (!specs[key]) {
       var alias = Object.keys(specs).filter(function (c) { return (specs[c].aliases || []).indexOf(key) >= 0; })[0] || KEY_ALIASES[key];
@@ -284,9 +285,9 @@ function exec(path, args, input, timeoutS) { // → {code, out, err, outData}
 }
 function curlQuote(v) { return '"' + String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t') + '"'; }
 
-// One HTTP request. req: {method, url, headers{}, form{} (repeatable values as arrays), json, multipart [{name, value | file}],
-// out (save body to this path), timeout}. → {status, text, json, saved, curl}. Tests replace this function.
-function http(req) {
+// One HTTP request. req: {method, url, headers{}, form{} (repeatable values as arrays), json, multipart [{name, value | file, filename}],
+// out (save body to this path), maxBytes, timeout}. → {status, text, json, saved, curl}. Tests replace this function.
+function curlConfig(req) {
   var cfg = ['silent', 'show-error', 'max-time = ' + (req.timeout || HTTP_TIMEOUT_S), 'request = ' + curlQuote(req.method || 'GET'), 'url = ' + curlQuote(req.url)];
   Object.keys(req.headers || {}).forEach(function (k) { cfg.push('header = ' + curlQuote(k + ': ' + req.headers[k])); });
   if (req.form) Object.keys(req.form).forEach(function (k) {
@@ -294,15 +295,33 @@ function http(req) {
   });
   if (req.json !== undefined) { cfg.push('header = "Content-Type: application/json"'); cfg.push('data-binary = ' + curlQuote(JSON.stringify(req.json))); }
   (req.multipart || []).forEach(function (p) {
-    cfg.push(p.file ? 'form = ' + curlQuote(p.name + '=@' + p.file) : 'form-string = ' + curlQuote(p.name + '=' + p.value));
+    if (!p.file) return cfg.push('form-string = ' + curlQuote(p.name + '=' + p.value));
+    // the -F grammar is parsed again inside the config value: quote the path and the file name, escaping " and \
+    var fq = function (x) { return '"' + String(x).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'; };
+    cfg.push('form = ' + curlQuote(p.name + '=@' + fq(p.file) + (p.filename ? ';filename=' + fq(p.filename) : '')));
   });
   if (req.out) cfg.push('output = ' + curlQuote(req.out));
+  if (req.maxBytes) cfg.push('max-filesize = ' + req.maxBytes);
+  cfg.push('proto = "=https,http"');
   cfg.push('write-out = "\\n%{http_code}"');
-  var r = exec('/usr/bin/curl', ['-K', '-'], cfg.join('\n') + '\n');
+  return cfg.join('\n') + '\n';
+}
+function http(req) {
+  // -q first: a user's ~/.curlrc must not add proxies, "insecure", output files or other URLs to these requests
+  var r = exec('/usr/bin/curl', ['-q', '-K', '-'], curlConfig(req));
   if (r.code !== 0) return { status: 0, curl: r.code, text: r.err.trim() };
   var nl = r.out.lastIndexOf('\n'), text = r.out.slice(0, nl), status = Number(r.out.slice(nl + 1)) || 0;
   return { status: status, text: text, json: safe(function () { return JSON.parse(text); }, undefined), saved: req.out || null };
 }
+// A URL the server handed back (download/upload links, the sign-in page) must be plain https on a known host.
+function serverURL(u, what, sameOrigin) {
+  var s = String(u || ''), m = /^(https?):\/\/([^\/?#@\s]+)(\/[^\s]*)?$/i.exec(s);
+  var base = SESSION.server || currentServer(), bm = /^(https?):\/\/([^\/]+)/i.exec(base);
+  if (!m || (m[1].toLowerCase() !== 'https' && !isLocalHost(m[2])) || (sameOrigin && bm && lower(m[2]) !== lower(bm[2])))
+    fail('The server returned an unexpected ' + what + ' address, so it was not used.', 'Check that ' + base + ' is really your Seafile server.');
+  return s;
+}
+function isLocalHost(host) { return /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(host); }
 
 // Keychain: one generic password per server (service seafile-mcp, account = server URL, secret = API token).
 var KEYCHAIN_SERVICE = 'seafile-mcp';
@@ -323,16 +342,18 @@ function openURL(url) { exec('/usr/bin/open', [url]); }
 var HTTP_TIMEOUT_S = 20;
 // The server address is never built in: the setting SEAFILE_URL, or the one remembered at the last sign-in.
 var STATE_ACCOUNT = '__server__'; // Keychain item that remembers which server was used last
+var SIGNIN_SERVER = ''; // the address given to sign_in, until that sign-in succeeds
 function normalServer(s) {
   s = trim(s || '');
   if (!s) return '';
-  if (!/^https?:\/\//i.test(s)) s = 'https://' + s;
-  var m = /^(https?:\/\/[^\/?#]+)(\/[^?#]*)?/i.exec(s);
-  if (!m) fail('"' + s + '" is not a server address.', 'Give it like https://cloud.example.com');
-  return (m[1] + (m[2] || '')).replace(/\/+$/, '');
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) s = 'https://' + s;
+  var m = /^(https?):\/\/([^\/?#\s"'\\<>@]+)(\/[^?#\s"'\\<>]*)?$/i.exec(s);
+  if (!m || /[\u0000-\u001f]/.test(s)) fail('"' + s + '" is not a server address.', 'Give it like https://cloud.example.com (no user name or password in it).');
+  if (m[1].toLowerCase() !== 'https' && !isLocalHost(m[2])) fail('Only https:// servers are used: the sign-in token must not travel unencrypted.', 'Use https://' + m[2]);
+  return m[1].toLowerCase() + '://' + m[2] + (m[3] || '').replace(/\/+$/, '');
 }
 function currentServer(explicit) {
-  var s = normalServer(explicit || env('SEAFILE_URL') || secretGet(STATE_ACCOUNT) || '');
+  var s = normalServer(explicit || SIGNIN_SERVER || env('SEAFILE_URL') || secretGet(STATE_ACCOUNT) || '');
   if (!s) fail('No Seafile server is set yet.', 'Ask the user for the server address, then call read {"action": "sign_in", "args": {"server": "https://…"}}, or set it in the extension settings (SEAFILE_URL).');
   return s;
 }
@@ -340,6 +361,7 @@ var SESSION = { server: null, token: null, user: null };
 function session() {
   var server = currentServer();
   if (SESSION.server === server && SESSION.token) return SESSION;
+  LIB_CACHE = { at: 0, list: null };
   var token = secretGet(server);
   if (!token) signIn(server); // opens the browser and fails with "sign in, then ask again" until done
   SESSION = { server: server, token: token || secretGet(server), user: null };
@@ -356,9 +378,12 @@ function signIn(server, waitS) {
     while (true) {
       var r = http({ url: server + '/api2/client-sso-link/' + pending + '/' });
       var st = r.json && r.json.status;
+      if (r.status === 0 || r.status >= 500 || (r.status === 200 && !st)) // a hiccup: keep waiting on the same sign-in
+        fail('Could not check the Seafile sign-in just now.', 'Call again in a moment; the sign-in page stays valid for 5 minutes after it was opened.');
       if (st === 'success' && r.json.apiToken) {
-        secretSet(server, r.json.apiToken); secretSet(STATE_ACCOUNT, server); secretDelete(server + PENDING_SUFFIX);
-        SESSION = { server: server, token: r.json.apiToken, user: r.json.username || null };
+        secretSet(server, r.json.apiToken); secretSet(STATE_ACCOUNT, server); secretDelete(server + PENDING_SUFFIX); // remembered only now
+        SESSION = { server: server, token: r.json.apiToken, user: r.json.username || null }; SIGNIN_SERVER = '';
+        LIB_CACHE = { at: 0, list: null };
         note('Signed in to ' + server + (r.json.username ? ' as ' + r.json.username : '') + '.');
         return SESSION;
       }
@@ -373,15 +398,16 @@ function signIn(server, waitS) {
     if (info.status === 0) failNetwork(info, server);
     fail(server + ' does not offer browser sign-in (got HTTP ' + info.status + ').', 'Is this the right Seafile server? Browser sign-in needs CLIENT_SSO_VIA_LOCAL_BROWSER on the server.');
   }
-  var t = String(info.json.link).replace(/\/+$/, '').split('/').pop();
-  secretSet(server + PENDING_SUFFIX, t); secretSet(STATE_ACCOUNT, server);
-  openURL(info.json.link);
+  SESSION.server = server;
+  var link = serverURL(info.json.link, 'sign-in page', true), t = link.replace(/\/+$/, '').split('/').pop();
+  secretSet(server + PENDING_SUFFIX, t);
+  openURL(link);
   fail('A browser window opened to sign in to Seafile (' + server + ').', 'Tell the user to sign in there, then call again — nothing else is needed.');
 }
 function signOut() {
   var server = currentServer();
   secretDelete(server); secretDelete(server + PENDING_SUFFIX);
-  SESSION = { server: null, token: null, user: null };
+  SESSION = { server: null, token: null, user: null }; LIB_CACHE = { at: 0, list: null };
   return { signed_out: server };
 }
 function failNetwork(r, server) {
@@ -402,6 +428,8 @@ function api(method, path, opts) {
   if (r.status >= 200 && r.status < 300) return r.json !== undefined ? r.json : r.text;
   var msg = (r.json && (r.json.error_msg || r.json.detail)) || (r.text || '').slice(0, 200) || 'HTTP ' + r.status;
   if (opts.allow && opts.allow.indexOf(r.status) >= 0) return { __status: r.status, error: msg };
+  if (r.status === 400 && /name invalid|invalid.*name/i.test(msg))
+    fail('Seafile does not accept this name.', 'Seafile refuses some characters in names — emoji, symbols like ✓, and \\. Letters in any language, digits, spaces and & # % ? " * : | are fine.');
   var hint = { 403: 'Your account has no permission for this here.', 404: 'Check the library and path (list_libraries, list_folder).', 429: 'Seafile is throttling requests; wait a little, then try once more.',
     440: 'The library is encrypted: unlock it in the Seafile web page first.', 441: 'The library is encrypted: unlock it in the Seafile web page first.', 443: 'The account is out of storage quota.',
     447: 'The library has too many files for this operation.', 423: 'The file is locked by someone else.', 520: 'Seafile could not do it; try again, or do it in the web page.' }[r.status] || 'Try again; if it repeats, tell the user what failed.';
@@ -426,8 +454,8 @@ function libraries() {
 function library(want) {
   var list = libraries(), w = trim(want);
   if (UUID.test(w)) { var byId = list.filter(function (l) { return l.id === w; })[0]; if (byId) return byId; fail('No library with id ' + w + '.', 'Ids come from list_libraries.'); }
-  var hits = list.filter(function (l) { return l.name === w; });
-  if (!hits.length) hits = list.filter(function (l) { return lower(l.name) === lower(w); });
+  var nw = w.normalize('NFC'), hits = list.filter(function (l) { return String(l.name).normalize('NFC') === nw; });
+  if (!hits.length) hits = list.filter(function (l) { return lower(String(l.name).normalize('NFC')) === lower(nw); });
   if (hits.length === 1) return hits[0];
   if (hits.length > 1) fail('Several libraries are named "' + w + '": ' + hits.map(function (l) { return l.id + ' (' + (l.owner || l.type) + ')'; }).join(', ') + '.', 'Pass the library id instead of the name.');
   fail('No library "' + w + '".' + didYouMean(w, list.map(function (l) { return l.name; })), 'Libraries: ' + list.map(function (l) { return l.name; }).slice(0, 40).join(', ') + '.');
@@ -439,6 +467,11 @@ function cleanPath(p) {
   var s = '/' + String(p == null ? '' : p).replace(/\\/g, '/').split('/').filter(function (x) { return x && x !== '.'; }).join('/');
   if (/(^|\/)\.\.(\/|$)/.test(s)) fail('".." is not allowed in paths.', 'Give the full path from the library root, e.g. /Projects/report.pdf');
   return s;
+}
+function checkName(name, what) { // the rules Seafile is known to enforce; the rest is left to the server
+  if (!name || name === '.' || name === '..') fail('"' + name + '" is not a usable ' + what + '.');
+  if (/[\\\/]/.test(name)) fail(what + ' "' + name + '" contains a slash or backslash.', 'Seafile does not allow \\ in names; / separates folders.');
+  if (name.length > 255) fail(what + ' is longer than 255 characters.');
 }
 function parentOf(p) { var i = p.lastIndexOf('/'); return i <= 0 ? '/' : p.slice(0, i); }
 function baseName(p) { return p.slice(p.lastIndexOf('/') + 1); }
@@ -456,7 +489,7 @@ function entry(lib, path) { // {type:'file'|'dir', ...} or null
   var parent = parentOf(path), name = baseName(path);
   var r = api('GET', '/api/v2.1/repos/' + lib.id + '/dir/', { query: { p: parent }, allow: [404] });
   if (r.__status) return null;
-  var e = (r.dirent_list || []).filter(function (x) { return x.name === name; })[0];
+  var want = name.normalize('NFC'), e = (r.dirent_list || []).filter(function (x) { return String(x.name).normalize('NFC') === want; })[0];
   return e ? { type: e.type === 'dir' ? 'dir' : 'file', name: e.name, path: path, size: e.size, mtime: e.mtime } : null;
 }
 function mustExist(lib, path) {
@@ -465,18 +498,22 @@ function mustExist(lib, path) {
   return e;
 }
 // Deleted items are recoverable only while the library keeps history; keep_days 0 means they are gone for good.
+// Only explicit evidence counts: keep_days -1 (forever) or > 0 from the owner's view, or the trash saying it can be searched.
 function deletesRecoverable(lib) {
   var h = api('GET', '/api2/repos/' + lib.id + '/history-limit/', { allow: [403, 404] });
-  if (!h.__status) return h.keep_days !== 0;
+  if (!h.__status) return typeof h.keep_days === 'number' && (h.keep_days === -1 || h.keep_days > 0);
   var t = api('GET', '/api/v2.1/repos/' + lib.id + '/trash2/', { query: { page: 1, per_page: 1 }, allow: [403, 404] });
-  return !t.__status && t.can_search !== false;
+  return !t.__status && t.can_search === true;
+}
+function mustKeepHistory(lib, what) {
+  if (!deletesRecoverable(lib)) fail('Library "' + lib.name + '" keeps no file history (or it could not be confirmed), so ' + what + ' could not be undone. Nothing was changed.', 'The user can do it in the Seafile web page.');
 }
 var TEXT_EXT = /\.(txt|md|markdown|csv|tsv|json|xml|ya?ml|toml|ini|cfg|conf|log|html?|css|js|ts|py|rb|go|rs|java|kt|swift|c|h|cpp|hpp|sh|zsh|sql|tex|rst|srt|vtt|env|properties)$/i;
 
 var SEAFILE = {
   sign_in: function (a) {
-    var server = currentServer(a.server);
-    if (a.server) secretSet(STATE_ACCOUNT, server);
+    if (a.server) SIGNIN_SERVER = normalServer(a.server);
+    var server = currentServer(); // a new address is remembered only once the sign-in succeeds
     var token = secretGet(server);
     if (token && !a.again) {
       SESSION = { server: server, token: token, user: null };
@@ -531,8 +568,9 @@ var SEAFILE = {
     notEncrypted(lib, 'reading files');
     var MAX = 5 * 1024 * 1024;
     if (e.size > MAX) fail(p + ' is ' + Math.round(e.size / 1048576) + ' MB, too big to read here.', 'Use download_file to save it locally.');
-    var url = api('GET', '/api2/repos/' + lib.id + '/file/', { query: { p: p } });
-    var r = http({ url: String(url), timeout: 60 });
+    var url = serverURL(api('GET', '/api2/repos/' + lib.id + '/file/', { query: { p: p } }), 'download');
+    var r = http({ url: url, timeout: 60, maxBytes: MAX });
+    if (r.curl === 63) fail(p + ' is bigger than 5 MB, too big to read here.', 'Use download_file to save it locally.');
     if (r.status !== 200) fail('Could not download ' + p + ' (HTTP ' + r.status + ').');
     if (!TEXT_EXT.test(p) && /[\u0000-\u0008\u000e-\u001f]/.test(r.text.slice(0, 4096))) fail(p + ' is not a text file.', 'Use download_file to save it, then open it with a suitable app.');
     var body = page(r.text, a.offset, a.max_chars);
@@ -560,11 +598,12 @@ var SEAFILE = {
     if (e.type === 'dir') fail(p + ' is a folder; only files can be downloaded here.');
     notEncrypted(lib, 'downloading');
     var dir = insideLocal(a.to, LOCAL_DIR, 'Files are saved');
-    $.NSFileManager.defaultManager.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(dir, true, $(), $());
-    var target = uniquePath(dir, baseName(p)), url = api('GET', '/api2/repos/' + lib.id + '/file/', { query: { p: p } });
+    if (!$.NSFileManager.defaultManager.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(dir, true, $(), $())) fail('Could not create ' + dir + '.');
+    var url = serverURL(api('GET', '/api2/repos/' + lib.id + '/file/', { query: { p: p } }), 'download'), tmp = privateTemp('download');
     checkCancelled();
-    var r = http({ url: String(url), out: target, timeout: CALL_TIMEOUT_S - 2 });
-    if (r.status !== 200) { safe(function () { $.NSFileManager.defaultManager.removeItemAtPathError(target, $()); }); fail('Could not download ' + p + (r.status ? ' (HTTP ' + r.status + ')' : r.curl === 28 ? ' in time' : '') + '.'); }
+    var r = http({ url: url, out: tmp, timeout: CALL_TIMEOUT_S - 2 });
+    if (r.status !== 200) { removeQuietly(tmp); fail('Could not download ' + p + (r.status ? ' (HTTP ' + r.status + ')' : r.curl === 28 ? ' in time' : '') + '.'); }
+    var target = placeWithoutReplacing(tmp, dir, baseName(p));
     return { saved: target, size: e.size, from: lib.name + ':' + p };
   },
   upload_file: function (a) {
@@ -572,14 +611,12 @@ var SEAFILE = {
     writable(lib); notEncrypted(lib, 'uploading');
     if (!$.NSFileManager.defaultManager.fileExistsAtPath(local)) fail('No local file ' + local + '.', 'Files to upload must be inside ' + LOCAL_DIR + '.');
     var name = baseName(local), existing = entry(lib, (dir === '/' ? '' : dir) + '/' + name);
+    checkName(name, 'File name');
     if (existing && !a.replace) fail(dir + '/' + name + ' already exists in "' + lib.name + '". Nothing was uploaded.', 'Pass replace:true to upload it as a new version (the old one stays in the file history).');
+    if (existing) mustKeepHistory(lib, 'replacing the file');
     if (a.dry_run) return { dry_run: true, would_upload: local, to: lib.name + ':' + (dir === '/' ? '' : dir) + '/' + name, replaces: !!existing };
-    var link = api('GET', '/api2/repos/' + lib.id + '/upload-link/', { query: { p: dir, replace: a.replace ? 1 : null } });
-    checkCancelled();
-    var r = http({ method: 'POST', url: String(link) + '?ret-json=1', multipart: [{ name: 'file', file: local }, { name: 'parent_dir', value: dir }, { name: 'replace', value: a.replace ? '1' : '0' }], timeout: CALL_TIMEOUT_S - 2 });
-    if (r.status !== 200) fail('Upload failed (' + (r.status ? 'HTTP ' + r.status + ': ' + String(r.text).slice(0, 120) : 'no answer in time') + ').', 'It may or may not have arrived: check with list_folder before trying again.');
-    var got = (r.json || [])[0] || {};
-    return { uploaded: lib.name + ':' + (dir === '/' ? '' : dir) + '/' + (got.name || name), size: got.size, replaced: !!existing };
+    var got = uploadAs(lib, dir, local, name, a.replace);
+    return { uploaded: lib.name + ':' + (dir === '/' ? '' : dir) + '/' + got.name, size: got.size, replaced: !!existing };
   },
   write_text_file: function (a) {
     var lib = library(a.library), p = cleanPath(a.path), dir = parentOf(p), name = baseName(p);
@@ -587,28 +624,27 @@ var SEAFILE = {
     var existing = entry(lib, p);
     if (existing && existing.type === 'dir') fail(p + ' is a folder.');
     if (existing && !a.replace) fail(p + ' already exists. Nothing was written.', 'Pass replace:true to save a new version (the old one stays in the file history).');
+    if (existing) mustKeepHistory(lib, 'replacing the file');
+    checkName(name, 'File name');
     if (a.dry_run) return { dry_run: true, would_write: lib.name + ':' + p, chars: a.text.length, replaces: !!existing };
-    var tmp = TMP_DIR + '/' + name;
-    $.NSFileManager.defaultManager.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(TMP_DIR, true, $(), $());
-    $(a.text).writeToFileAtomicallyEncodingError(tmp, true, $.NSUTF8StringEncoding, $());
+    var tmp = privateTemp('text');
+    if (!$(a.text).writeToFileAtomicallyEncodingError(tmp, true, $.NSUTF8StringEncoding, $())) fail('Could not prepare the text locally. Nothing was written.');
     try {
       checkCancelled();
       var r;
       if (existing) {
-        var up = api('GET', '/api2/repos/' + lib.id + '/update-link/', { query: { p: dir } });
-        r = http({ method: 'POST', url: String(up), multipart: [{ name: 'file', file: tmp }, { name: 'target_file', value: p }] });
-      } else {
-        var link = api('GET', '/api2/repos/' + lib.id + '/upload-link/', { query: { p: dir } });
-        r = http({ method: 'POST', url: String(link) + '?ret-json=1', multipart: [{ name: 'file', file: tmp }, { name: 'parent_dir', value: dir }] });
-      }
-      if (r.status !== 200) fail('Saving failed (' + (r.status ? 'HTTP ' + r.status : 'no answer') + ').', 'Check with list_folder before trying again.');
-    } finally { safe(function () { $.NSFileManager.defaultManager.removeItemAtPathError(tmp, $()); }); }
+        var up = serverURL(api('GET', '/api2/repos/' + lib.id + '/update-link/', { query: { p: dir } }), 'upload');
+        r = http({ method: 'POST', url: up, multipart: [{ name: 'file', file: tmp, filename: name.replace(/"/g, '_') }, { name: 'target_file', value: p }] });
+        if (r.status !== 200) fail('Saving failed (' + (r.status ? 'HTTP ' + r.status : 'no answer') + ').', 'Check with list_folder before trying again.');
+      } else uploadAs(lib, dir, tmp, name, false);
+    } finally { removeQuietly(tmp); }
     return { written: lib.name + ':' + p, chars: a.text.length, replaced: !!existing };
   },
   create_folder: function (a) {
     var lib = library(a.library), p = cleanPath(a.path);
     writable(lib);
     if (p === '/') fail('Give the folder path, e.g. /Projects/2026.');
+    p.split('/').filter(Boolean).forEach(function (x) { checkName(x, 'Folder name'); });
     if (entry(lib, p)) fail(p + ' already exists in "' + lib.name + '".');
     api('POST', '/api2/repos/' + lib.id + '/dir/', { query: { p: p }, form: { operation: 'mkdir', create_parents: 'true' } });
     var made = entry(lib, p);
@@ -618,7 +654,8 @@ var SEAFILE = {
   rename: function (a) {
     var lib = library(a.library), p = cleanPath(a.path), e = mustExist(lib, p);
     writable(lib);
-    if (/[\/\\]/.test(a.new_name)) fail('new_name is a name, not a path.', 'To move it somewhere else, use move.');
+    if (/\//.test(a.new_name)) fail('new_name is a name, not a path.', 'To move it somewhere else, use move.');
+    checkName(a.new_name, 'The new name');
     if (p === '/') fail('The library root cannot be renamed here.');
     if (entry(lib, (parentOf(p) === '/' ? '' : parentOf(p)) + '/' + a.new_name)) fail('"' + a.new_name + '" already exists next to it. Nothing was renamed.');
     var r = api('POST', '/api/v2.1/repos/' + lib.id + '/' + (e.type === 'dir' ? 'dir' : 'file') + '/', { query: { p: p }, form: { operation: 'rename', newname: a.new_name } });
@@ -632,10 +669,10 @@ var SEAFILE = {
   'delete': function (a) {
     var lib = library(a.library), paths = a.paths.map(cleanPath);
     writable(lib);
-    if (paths.indexOf('/') >= 0) fail('The library root cannot be deleted here.');
+    checkItems(paths, 'deleted');
     var found = paths.map(function (p) { return { p: p, e: entry(lib, p) }; }), missing = found.filter(function (x) { return !x.e; });
     if (missing.length) fail('Not found: ' + missing.map(function (x) { return x.p; }).join(', ') + '. Nothing was deleted.', 'Check the paths with list_folder.');
-    if (!deletesRecoverable(lib)) fail('Library "' + lib.name + '" keeps no history, so deleted items could not be restored. Nothing was deleted.', 'The user can delete them in the Seafile web page.');
+    mustKeepHistory(lib, 'deleting');
     if (a.dry_run) return { dry_run: true, would_move_to_trash: found.map(function (x) { return { path: x.p, type: x.e.type === 'dir' ? 'folder' : 'file', size: x.e.size }; }) };
     var byParent = {};
     found.forEach(function (x) { (byParent[parentOf(x.p)] = byParent[parentOf(x.p)] || []).push(baseName(x.p)); });
@@ -650,6 +687,7 @@ var SEAFILE = {
     var hits = trash.filter(function (x) { return (x.parent_dir === '/' ? '' : x.parent_dir.replace(/\/$/, '')) + '/' + x.obj_name === p; });
     if (a.commit_id) hits = hits.filter(function (x) { return x.commit_id === a.commit_id; });
     if (!hits.length) fail(p + ' is not in the trash of "' + lib.name + '".', 'See list_trash for what can be restored.');
+    if (hits.length > 1) fail(p + ' was deleted ' + hits.length + ' times; say which one.', 'Pass commit_id from list_trash: ' + hits.map(function (h) { return h.commit_id + ' (' + h.deleted_time + ')'; }).join(', ') + '.');
     if (entry(lib, p)) fail('Something already exists at ' + p + '. Nothing was restored.', 'Rename or move it first.');
     var r = api('POST', '/api/v2.1/repos/' + lib.id + '/trash/revert-dirents/', { form: { path: [p], commit_id: hits[0].commit_id } });
     var failed = (r && r.failed) || [];
@@ -669,8 +707,8 @@ var SEAFILE = {
     mustExist(lib, p);
     var form = { repo_id: lib.id, path: p, permissions: JSON.stringify({ can_edit: false, can_download: a.can_download, can_upload: !!a.can_upload }) };
     if (a.password) form.password = a.password;
-    if (a.expire_days) form.expire_days = a.expire_days;
-    if (a.dry_run) return { dry_run: true, would_share: lib.name + ':' + p, password: !!a.password, expire_days: a.expire_days || 'never', can_download: a.can_download, can_upload: !!a.can_upload };
+    if (a.expire_days > 0) form.expire_days = a.expire_days;
+    if (a.dry_run) return { dry_run: true, would_share: lib.name + ':' + p, password: !!a.password, expire_days: a.expire_days > 0 ? a.expire_days : 'never', can_download: a.can_download, can_upload: !!a.can_upload };
     var r = api('POST', '/api/v2.1/share-links/', { form: form });
     note('Anyone with this link can open it' + (a.password ? ' with the password' : '') + '. delete_share_link removes it.');
     return shareOut(r);
@@ -688,10 +726,41 @@ function shareOut(x) {
   return { token: x.token, link: x.link, path: x.path, library_id: x.repo_id, folder: !!x.is_dir, expires: x.expire_date || null, expired: !!x.is_expired,
     password: !!x.password, views: x.view_cnt, can_download: x.permissions ? x.permissions.can_download : undefined, can_upload: x.permissions ? x.permissions.can_upload : undefined };
 }
+// Upload localFile into dir as wantedName. curl percent-encodes some characters (") in multipart file names, and
+// Seafile would keep them encoded, so such files go up under a plain staging name and are renamed right after.
+function uploadAs(lib, dir, localFile, wantedName, replace) {
+  checkName(wantedName, 'File name');
+  var plain = !/["\r\n]/.test(wantedName), stage = plain ? localFile : privateTemp('upload');
+  if (!plain && !$.NSFileManager.defaultManager.copyItemAtPathToPathError(localFile, stage, $())) fail('Could not prepare ' + wantedName + ' for upload. Nothing was uploaded.');
+  try {
+    var link = serverURL(api('GET', '/api2/repos/' + lib.id + '/upload-link/', { query: { p: dir, replace: replace ? 1 : null } }), 'upload');
+    checkCancelled();
+    var parts = [{ name: 'file', file: stage }, { name: 'parent_dir', value: dir }, { name: 'replace', value: replace ? '1' : '0' }];
+    if (plain && baseName(localFile) !== wantedName) parts[0].filename = wantedName;
+    var r = http({ method: 'POST', url: link + '?ret-json=1', multipart: parts, timeout: CALL_TIMEOUT_S - 2 });
+    if (r.status !== 200) fail('Upload failed (' + (r.status ? 'HTTP ' + r.status + ': ' + String(r.text).slice(0, 120) : 'no answer in time') + ').', 'It may or may not have arrived: check with list_folder before trying again.');
+    var got = ((r.json || [])[0] || {}), stored = got.name || baseName(stage);
+    if (!plain) {
+      var from = (dir === '/' ? '' : dir) + '/' + stored;
+      var ren = api('POST', '/api/v2.1/repos/' + lib.id + '/file/', { query: { p: from }, form: { operation: 'rename', newname: wantedName }, allow: [400, 403, 404, 520] });
+      if (ren.__status) { api('DELETE', '/api/v2.1/repos/' + lib.id + '/file/', { query: { p: from }, allow: [404] }); fail('Seafile would not take the name "' + wantedName + '": ' + ren.error + '. Nothing was left behind.'); }
+      stored = ren.obj_name || wantedName;
+    }
+    return { name: stored, size: got.size };
+  } finally { if (!plain) removeQuietly(stage); }
+}
+function checkItems(paths, verb) { // no root, no repeats, not a folder together with something inside it
+  if (paths.indexOf('/') >= 0) fail('The library root cannot be ' + verb + ' here.');
+  paths.forEach(function (p, i) {
+    if (paths.indexOf(p) !== i) fail(p + ' is listed twice.');
+    paths.forEach(function (q) { if (q !== p && q.indexOf(p + '/') === 0) fail(q + ' is inside ' + p + '; list only one of them.'); });
+  });
+}
 function moveOrCopy(a, op) {
   var lib = library(a.library), dstLib = a.to_library ? library(a.to_library) : lib, paths = a.paths.map(cleanPath), dst = cleanPath(a.to_folder);
   if (op === 'move') writable(lib);
   writable(dstLib);
+  checkItems(paths, op === 'move' ? 'moved' : 'copied');
   var found = paths.map(function (p) { return { p: p, e: entry(lib, p) }; }), missing = found.filter(function (x) { return !x.e; });
   if (missing.length) fail('Not found: ' + missing.map(function (x) { return x.p; }).join(', ') + '. Nothing was ' + (op === 'move' ? 'moved' : 'copied') + '.');
   var target = entry(dstLib, dst);
@@ -706,17 +775,36 @@ function moveOrCopy(a, op) {
   if (a.dry_run) return { dry_run: true, would: op, items: paths, to: dstLib.name + ':' + dst };
   var byParent = {};
   paths.forEach(function (p) { (byParent[parentOf(p)] = byParent[parentOf(p)] || []).push(baseName(p)); });
+  var done = [];
   Object.keys(byParent).forEach(function (parent) {
     checkCancelled();
-    api('POST', '/api/v2.1/repos/sync-batch-' + op + '-item/', { json: { src_repo_id: lib.id, src_parent_dir: parent, src_dirents: byParent[parent], dst_repo_id: dstLib.id, dst_parent_dir: dst } });
+    try { api('POST', '/api/v2.1/repos/sync-batch-' + op + '-item/', { json: { src_repo_id: lib.id, src_parent_dir: parent, src_dirents: byParent[parent], dst_repo_id: dstLib.id, dst_parent_dir: dst } }); }
+    catch (e) { if (done.length && e instanceof UserError) fail(e.message + ' Already ' + (op === 'move' ? 'moved' : 'copied') + ': ' + done.join(', ') + '; the rest was not.', 'Check with list_folder before trying again.'); throw e; }
+    byParent[parent].forEach(function (n) { done.push((parent === '/' ? '' : parent) + '/' + n); });
   });
   return { done: op, items: paths, to: dstLib.name + ':' + dst };
 }
-function uniquePath(dir, name) {
-  var clean = String(name || 'file').replace(/[\/:]/g, '_').replace(/^\.+/, '_'), p = dir + '/' + clean, n = 1;
+// Local files: private temp names, and a final move that never replaces or follows anything already there
+// (a dangling symlink counts as taken, so a planted link cannot redirect the file outside the folder).
+function privateTemp(kind) {
+  var fm = $.NSFileManager.defaultManager;
+  if (!fm.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(TMP_DIR, true, $({ NSFilePosixPermissions: 448 }), $())) fail('Could not create a temporary folder.');
+  return TMP_DIR + '/' + kind + '-' + Date.now() + '-' + Math.floor(Math.random() * 1e9) + '.part';
+}
+function removeQuietly(p) { safe(function () { $.NSFileManager.defaultManager.removeItemAtPathError(p, $()); }); }
+function taken(p) { // exists, or is a symlink (even one pointing nowhere)
+  return $.NSFileManager.defaultManager.fileExistsAtPath(p) || !!ObjC.unwrap($.NSFileManager.defaultManager.destinationOfSymbolicLinkAtPathError(p, $()));
+}
+function placeWithoutReplacing(tmp, dir, name) {
+  var fm = $.NSFileManager.defaultManager, clean = String(name || 'file').replace(/[\/:]/g, '_').replace(/^\.+/, '_');
   var dot = clean.lastIndexOf('.'), base = dot > 0 ? clean.slice(0, dot) : clean, ext = dot > 0 ? clean.slice(dot) : '';
-  while ($.NSFileManager.defaultManager.fileExistsAtPath(p)) p = dir + '/' + base + ' (' + (n++) + ')' + ext;
-  return p;
+  for (var n = 0; n < 1000; n++) {
+    var p = dir + '/' + (n ? base + ' (' + n + ')' + ext : clean);
+    if (taken(p)) continue;
+    if (fm.moveItemAtPathToPathError(tmp, p, $())) return p; // fails instead of replacing if something appeared meanwhile
+  }
+  removeQuietly(tmp);
+  fail('Could not find a free file name in ' + dir + '.');
 }
 
 // ======================================================================
@@ -760,8 +848,8 @@ var ACTIONS = {
   restore: { tool: 'write', guard: true, desc: 'Put a deleted file/folder back from the trash.', args: { library: LIB, path: { type: 'string', required: true }, commit_id: { type: 'string' } }, run: SEAFILE.restore },
   revert_file: { tool: 'write', guard: true, desc: 'Bring back an earlier version of a file (commit_id from file_history).',
     args: { library: LIB, path: { type: 'string', required: true }, commit_id: { type: 'string', required: true } }, run: SEAFILE.revert_file },
-  create_share_link: { tool: 'write', guard: true, desc: 'Make a share link (view + download by default). dry_run shows it first.',
-    args: { library: LIB, path: { type: 'string', required: true }, password: { type: 'string' }, expire_days: { type: 'integer', min: 1, max: 3650 }, can_download: { type: 'boolean', 'default': true }, can_upload: { type: 'boolean', 'default': false }, dry_run: DRY }, run: SEAFILE.create_share_link },
+  create_share_link: { tool: 'write', guard: true, desc: 'Make a share link (view + download, expires in 30 days by default). dry_run shows it first.',
+    args: { library: LIB, path: { type: 'string', required: true }, password: { type: 'string' }, expire_days: { type: 'integer', 'default': 30, min: 0, max: 3650, desc: 'default 30; 0 = never' }, can_download: { type: 'boolean', 'default': true }, can_upload: { type: 'boolean', 'default': false }, dry_run: DRY }, run: SEAFILE.create_share_link },
   delete_share_link: { tool: 'write', guard: true, desc: 'Remove a share link (token or the link itself).', args: { token: { type: 'string', required: true, aliases: ['link', 'url'] } }, run: SEAFILE.delete_share_link },
   sign_out: { tool: 'write', desc: 'Forget the stored sign-in for this server.', args: {}, run: SEAFILE.sign_out }
 };
@@ -976,8 +1064,8 @@ function toolCall(id, tool, input) {
     remember(call, true);
     log('← ' + id + ' ' + call.name + (r.timeout ? ' TIMEOUT' : ' WORKER DIED') + ' after ' + ms + 'ms');
     return text('Error: ' + (r.timeout ? app + ' did not answer within ' + CALL_TIMEOUT_S + ' s, so the call was stopped.' : 'The process talking to ' + app + ' ended before it answered.') +
-      '\nHow to fix: ' + app + ' may be busy, showing a dialog, or waiting for an Automation permission prompt — check it on the Mac.' +
-      (call.spec.tool === 'write' ? ' The change may or may not have happened: check (e.g. the Sent folder) before trying again.' : ' Then try again, perhaps with a smaller limit or a narrower search.'), true);
+      '\nHow to fix: the server or the network may be slow, or a large file is still moving.' +
+      (call.spec.tool === 'write' ? ' The change may or may not have happened: check with list_folder, list_trash or list_share_links before trying again.' : ' Then try again, perhaps with a smaller limit or a narrower search.'), true);
   }
   log('← ' + id + ' ' + call.name + ' ' + ms + 'ms ' + (r.error ? 'error' + (r.error.number ? ' ' + r.error.number : '') : 'ok'));
   if (r.error) {
@@ -1015,7 +1103,11 @@ var Worker = {
   },
   stop: function () {
     if (this.observer) { $.NSNotificationCenter.defaultCenter.removeObserver(this.observer); this.observer = null; }
-    if (this.task) { safe(function () { Worker.task.terminate; }); log('worker stopped'); }
+    if (this.task) {
+      var pid = safe(function () { return Number(Worker.task.processIdentifier); }, 0);
+      if (pid) safe(function () { exec('/usr/bin/pkill', ['-TERM', '-P', String(pid)]); }); // its curl too, so an upload really stops
+      safe(function () { Worker.task.terminate; }); log('worker stopped');
+    }
     this.task = null; this.input = null;
   },
   warm: function () { if (this.usable() && !this.task) safe(function () { Worker.start(); }); },
@@ -1135,7 +1227,7 @@ function onChunk(data) {
     line = line.trim();
     if (!line) return;
     var msg;
-    try { msg = JSON.parse(line); } catch (e) { log('bad json: ' + line.slice(0, 200)); return send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }); }
+    try { msg = JSON.parse(line); } catch (e) { log('bad json (' + line.length + ' chars)'); return send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }); }
     onMessage(msg);
   });
 }

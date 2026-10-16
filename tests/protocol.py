@@ -235,6 +235,37 @@ with open(cfg) as f:
     check("invalid config is refused and left alone", r.returncode != 0 and f.read() == "not json")
 shutil.rmtree(home)
 
+# real curl, local HTTP server: hostile file names stay one multipart part, ~/.curlrc is ignored
+import http.server
+import socketserver
+import tempfile as _tf
+got = []
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0)); got.append(self.rfile.read(n)); self.send_response(200); self.end_headers(); self.wfile.write(b"[]")
+    def log_message(self, *a): pass
+srv = socketserver.TCPServer(("127.0.0.1", 0), H); port = srv.server_address[1]
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+d = _tf.mkdtemp(); hostile = os.path.join(d, 'a,etc;type=x "q".txt')
+with open(hostile, "w") as f: f.write("PAYLOAD")
+home = _tf.mkdtemp()
+with open(os.path.join(home, ".curlrc"), "w") as f: f.write('url = "http://127.0.0.1:%d/curlrc-extra"\n' % port)
+jxa = os.path.join(d, "h.js")
+with open(jxa, "w") as f:
+    f.write("""ObjC.import('Foundation');
+function run(argv) {
+  var src = ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, null)).replace(/\\nfunction run\\(\\) \\{/, '\\nfunction serverRun() {');
+  (0, eval)(src);
+  var r = http({ method: 'POST', url: argv[1], multipart: [{ name: 'file', file: argv[2], filename: 'shown;name,"x".txt' }, { name: 'parent_dir', value: '/' }] });
+  return String(r.status);
+}""")
+r = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", jxa, SERVER, "http://127.0.0.1:%d/upload" % port, hostile], capture_output=True, text=True, timeout=60, env=dict(os.environ, HOME=home))
+body = got[0] if got else b""
+check("real curl: request reached the local server", r.stdout.strip() == "200" and len(got) == 1, r.stdout + r.stderr + " requests=%d" % len(got))
+check("real curl: one file part with the given name", body.count(b"PAYLOAD") == 1 and body.count(b'name="file"') == 1 and b'filename="shown;name,' in body, body[:400])
+check("real curl: ~/.curlrc ignored", len(got) == 1)
+srv.shutdown(); shutil.rmtree(d); shutil.rmtree(home)
+
 if failures:
     print("FAILED:\n  " + "\n  ".join(failures))
     sys.exit(1)
