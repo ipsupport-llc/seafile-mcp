@@ -1,0 +1,10 @@
+.DS_Store
+.git/
+.github/
+.gitignore
+*.mcpb
+install.sh
+server.json
+test.sh
+tests/
+uninstall.sh

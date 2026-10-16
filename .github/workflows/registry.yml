@@ -1,0 +1,53 @@
+name: MCP Registry
+
+# Lists a release in the MCP Registry (registry.modelcontextprotocol.io) as
+# io.github.ipsupport-llc/seafile-mcp: the .mcpb from the GitHub release, its sha256, GitHub OIDC login.
+# Runs after every release (called from release.yml); by hand only to retry or to list an older release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to list, e.g. v1.4.0"
+        required: true
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-26.04
+    env:
+      TAG: ${{ inputs.tag }}
+      PUBLISHER_VERSION: v1.8.1
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Fill in server.json from the release
+        run: |
+          case "$TAG" in v[0-9]*) ;; *) echo "not a version tag: $TAG"; exit 1 ;; esac
+          gh release download "$TAG" -p seafile-mcp.mcpb -D "$RUNNER_TEMP"
+          SHA=$(sha256sum "$RUNNER_TEMP/seafile-mcp.mcpb" | cut -d' ' -f1)
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/seafile-mcp.mcpb"
+          jq --arg v "${TAG#v}" --arg u "$URL" --arg s "$SHA" \
+            '.version=$v | .packages[0].identifier=$u | .packages[0].fileSha256=$s' server.json > s.tmp && mv s.tmp server.json
+          cat server.json
+
+      - name: Install mcp-publisher (pinned, checksum verified)
+        run: |
+          BASE="https://github.com/modelcontextprotocol/registry/releases/download/$PUBLISHER_VERSION"
+          curl -fsSLO "$BASE/mcp-publisher_linux_amd64.tar.gz"
+          curl -fsSL "$BASE/registry_${PUBLISHER_VERSION#v}_checksums.txt" | grep ' mcp-publisher_linux_amd64.tar.gz$' | sha256sum -c -
+          tar xzf mcp-publisher_linux_amd64.tar.gz mcp-publisher
+
+      - name: Publish
+        run: |
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish

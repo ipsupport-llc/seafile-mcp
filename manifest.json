@@ -1,0 +1,62 @@
+{
+  "manifest_version": "0.3",
+  "name": "seafile-mcp",
+  "display_name": "Seafile",
+  "version": "0.1.0",
+  "description": "Your Seafile files for your AI assistant — libraries, folders, search, read, upload, share links. Browser sign-in, no dependencies.",
+  "long_description": "Runs on JavaScript for Automation (osascript), which ships with macOS: no Node, Python or Homebrew. Signs in through the browser like the Seafile desktop client (password, SSO, two-factor — whatever your server uses); the token is kept in the macOS Keychain. Two tools — `read` (never changes anything) and `write` (upload, move, delete to trash, share) — so you approve permissions twice, not thirty times.",
+  "author": {
+    "name": "IPSupport LLC",
+    "email": "hello@ipsupport.us",
+    "url": "https://ipsupport.us"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ipsupport-llc/seafile-mcp.git"
+  },
+  "license": "MIT",
+  "icon": "icon.png",
+  "keywords": ["seafile", "files", "cloud storage", "sync", "share links", "jxa"],
+  "server": {
+    "type": "binary",
+    "entry_point": "server/seafile-mcp.js",
+    "mcp_config": {
+      "command": "/usr/bin/osascript",
+      "args": ["-l", "JavaScript", "${__dirname}/server/seafile-mcp.js"],
+      "env": {
+        "SEAFILE_URL": "${user_config.server_url}",
+        "SEAFILE_LOCAL_DIR": "${user_config.local_dir}",
+        "SEAFILE_READ_ONLY": "${user_config.read_only}"
+      }
+    }
+  },
+  "user_config": {
+    "server_url": {
+      "type": "string",
+      "title": "Seafile server",
+      "description": "Address of your Seafile server, e.g. https://cloud.example.com. Leave empty to tell the assistant the first time.",
+      "default": "",
+      "required": false
+    },
+    "local_dir": {
+      "type": "directory",
+      "title": "Local folder",
+      "description": "The only folder files are downloaded to and uploaded from.",
+      "default": "${HOME}/Downloads",
+      "required": false
+    },
+    "read_only": {
+      "type": "boolean",
+      "title": "Read-only mode",
+      "description": "Hide the write tool: the assistant can browse, search and read but never upload, move, delete or share.",
+      "default": false,
+      "required": false
+    }
+  },
+  "tools": [
+    { "name": "read", "description": "Libraries, folders, search by name, read text files, versions, trash, share links." },
+    { "name": "write", "description": "Upload, download, write text files, create folders, rename, move, copy, delete to trash, restore, share links." }
+  ],
+  "tools_generated": false,
+  "compatibility": { "platforms": ["darwin"] }
+}

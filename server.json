@@ -1,0 +1,28 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.ipsupport-llc/seafile-mcp",
+  "title": "Seafile",
+  "description": "Seafile libraries, folders, files and share links for any MCP client. Browser sign-in, no deps.",
+  "repository": {
+    "url": "https://github.com/ipsupport-llc/seafile-mcp",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/ipsupport-llc/seafile-mcp",
+  "icons": [
+    { "src": "https://raw.githubusercontent.com/ipsupport-llc/seafile-mcp/main/icon.png", "mimeType": "image/png", "sizes": ["512x512"] }
+  ],
+  "version": "0.0.0",
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/ipsupport-llc/seafile-mcp/releases/download/v0.0.0/seafile-mcp.mcpb",
+      "fileSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        { "name": "SEAFILE_URL", "description": "Seafile server address; if empty, given at the first sign-in", "format": "string", "isRequired": false, "isSecret": false },
+        { "name": "SEAFILE_LOCAL_DIR", "description": "The only local folder for downloads and uploads (default ~/Downloads)", "format": "filepath", "isRequired": false, "isSecret": false },
+        { "name": "SEAFILE_READ_ONLY", "description": "true hides the write tool", "format": "boolean", "isRequired": false, "isSecret": false }
+      ]
+    }
+  ]
+}

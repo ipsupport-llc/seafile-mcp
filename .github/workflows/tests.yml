@@ -1,0 +1,37 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - run: sw_vers
+
+      - name: Server compiles
+        run: osacompile -l JavaScript -o "$RUNNER_TEMP/server.scpt" server/seafile-mcp.js
+
+      - name: Unit tests (fake Mail, Calendar and Notes)
+        run: /usr/bin/osascript -l JavaScript tests/unit.js server/seafile-mcp.js
+
+      - name: Protocol tests
+        run: python3 tests/protocol.py
+
+      - name: Version numbers agree
+        run: |
+          S=$(sed -n "s/^var VERSION = '\(.*\)';.*/\1/p" server/seafile-mcp.js)
+          M=$(python3 -c "import json; print(json.load(open('manifest.json'))['version'])")
+          echo "server $S, manifest $M"
+          [ "$S" = "$M" ]
