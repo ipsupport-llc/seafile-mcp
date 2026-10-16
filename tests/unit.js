@@ -44,7 +44,9 @@ function fakeHttp(F) {
     }
     if (/^\/seafhttp\/(upload|update)-api\//.test(path)) {
       var parts = {}; (req.multipart || []).forEach(function (p) { parts[p.name] = p.file ? ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(p.file, $.NSUTF8StringEncoding, $())) : p.value; });
-      var lb = F.libs[F.uploadLib], name = (req.multipart.filter(function (p) { return p.name === 'file'; })[0].file || '').split('/').pop();
+      var fp = req.multipart.filter(function (p) { return p.name === 'file'; })[0];
+      var lb = F.libs[F.uploadLib], name = fp.filename || (fp.file || '').split('/').pop();
+      if (/"/.test(name)) name = name.replace(/"/g, '%22'); // what curl does to quotes in multipart file names
       var target = parts.target_file || ((parts.parent_dir === '/' ? '' : parts.parent_dir) + '/' + name);
       lb.items[target] = { type: 'file', content: parts.file }; F.uploads.push(target);
       return ok([{ name: name, id: 'x', size: String(parts.file).length }]);
@@ -144,6 +146,9 @@ function run(argv) {
   test('sign_in with a server address remembers it; no address is ever built in', function () {
     delete F.secrets[STATE_ACCOUNT]; delete F.secrets[SERVER_URL];
     has(callErr('read', { action: 'sign_in', args: { server: 'files.example.com' } }), 'browser window');
+    eq(F.secrets[STATE_ACCOUNT], undefined, 'not remembered before the sign-in succeeds');
+    F.sso.sso1 = 'done';
+    call('read', { action: 'sign_in', args: { server: 'files.example.com' } });
     eq(F.secrets[STATE_ACCOUNT], SERVER_URL);
   });
   test('offline: plain words', function () { F.offline = true; has(callErr('read', { action: 'status' }), 'could not be resolved'); });
@@ -188,6 +193,12 @@ function run(argv) {
     ok(a.saved !== b.saved, 'second copy got a new name'); ok(a.saved.indexOf(LOCAL + '/') === 0 && b.saved.indexOf(LOCAL + '/') === 0, 'inside the local folder');
     has(callErr('write', { action: 'download_file', args: { library: L, path: '/notes.txt', to: '/etc' } }), 'only inside');
   });
+  test('names: quotes survive an upload; backslashes and Seafile-refused names get clear errors', function () {
+    var L = '11111111-1111-1111-1111-111111111111';
+    call('write', { action: 'write_text_file', args: { library: L, path: '/say "hi".md', text: 'x' } });
+    ok(F.lib('Projects').items['/say "hi".md'], 'stored with real quotes: ' + Object.keys(F.lib('Projects').items).join(', '));
+    has(callErr('write', { action: 'rename', args: { library: L, path: '/notes.txt', new_name: 'a\\b.txt' } }), 'backslash');
+  });
   test('write_text_file keeps the text byte for byte', function () {
     call('write', { action: 'write_text_file', args: { library: '11111111-1111-1111-1111-111111111111', path: '/raw.md', text: '  indented\nlast line\n\n' } });
     eq(F.lib('Projects').items['/raw.md'].content, '  indented\nlast line\n\n');
@@ -218,7 +229,7 @@ function run(argv) {
   });
   test('delete goes to trash only where history is kept; restore puts it back', function () {
     var L = '11111111-1111-1111-1111-111111111111';
-    has(callErr('write', { action: 'delete', args: { library: 'Scratch', paths: ['/tmp.txt'] } }), 'keeps no history');
+    has(callErr('write', { action: 'delete', args: { library: 'Scratch', paths: ['/tmp.txt'] } }), 'keeps no file history');
     has(callErr('write', { action: 'delete', args: { library: L, paths: ['/notes.txt', '/ghost.txt'] } }), 'Nothing was deleted');
     ok(F.lib('Projects').items['/notes.txt'], 'nothing deleted when one path is wrong');
     var r = call('write', { action: 'rm', args: { library: L, paths: '/notes.txt' } });
@@ -246,6 +257,70 @@ function run(argv) {
     has(callErr('write', { action: 'create_folder', args: { library: 'Scratch', path: '/x', colour: 'red' } }), 'Unknown argument "colour"');
     has(call('read', { action: 'status', args: { colour: 'red' } }).notes.join(' '), 'ignored');
   });
+  // ---- review fixes
+  test('curl config: paths and names with , ; " \\ stay one quoted value', function () {
+    var c = curlConfig({ method: 'POST', url: 'https://x/u', multipart: [{ name: 'file', file: '/d/a,/etc/hosts;type=x "q" \\b', filename: 'n;m,"z".txt' }] });
+    var line = c.split('\n').filter(function (l) { return /^form = /.test(l); })[0];
+    eq(line, 'form = "file=@\\"/d/a,/etc/hosts;type=x \\\\\\"q\\\\\\" \\\\\\\\b\\";filename=\\"n;m,\\\\\\"z\\\\\\".txt\\""');
+    ok(c.indexOf('proto = "=https,http"') >= 0, 'only http(s)');
+  });
+  test('a single path string is one target, never split on commas', function () {
+    var L = '11111111-1111-1111-1111-111111111111';
+    F.lib('Projects').items['/a'] = { type: 'file', content: '1' }; F.lib('Projects').items['/b.txt'] = { type: 'file', content: '2' };
+    has(callErr('write', { action: 'delete', args: { library: L, paths: '/a,b.txt' } }), 'Not found: /a,b.txt');
+    ok(F.lib('Projects').items['/a'] && F.lib('Projects').items['/b.txt'], 'nothing deleted');
+  });
+  test('servers: https only (localhost may be http), no user:password, no odd characters', function () {
+    has(callErr('read', { action: 'sign_in', args: { server: 'http://files.example.com' } }), 'Only https://');
+    has(callErr('read', { action: 'sign_in', args: { server: 'https://u:p@files.example.com' } }), 'not a server address');
+    eq(normalServer('http://localhost:8000/'), 'http://localhost:8000');
+  });
+  test('links handed back by the server must be https; the sign-in page must be on the same server', function () {
+    var orig = http;
+    http = function (req) { var r = orig(req); if (/\/file\/$/.test(parse(req.url).path) && (req.method || 'GET') === 'GET' && r.status === 200) return { status: 200, json: 'file:///etc/passwd', text: '"file:///etc/passwd"' }; return r; };
+    has(callErr('read', { action: 'read_file', args: { library: '11111111-1111-1111-1111-111111111111', path: '/notes.txt' } }), 'unexpected download address');
+    http = function (req) { if (/client-sso-link\/$/.test(req.url)) return { status: 200, json: { link: 'https://evil.example.org/client-sso/x/' }, text: '' }; return orig(req); };
+    delete F.secrets[SERVER_URL]; SESSION = { server: null, token: null, user: null };
+    has(callErr('read', { action: 'status' }), 'unexpected sign-in page');
+    eq(F.opened.length, 0);
+  });
+  test('download never writes through a dangling symlink', function () {
+    var link = LOCAL + '/notes.txt';
+    $.NSFileManager.defaultManager.removeItemAtPathError(link, $());
+    $.NSFileManager.defaultManager.createSymbolicLinkAtPathWithDestinationPathError(link, '/tmp/seafile-mcp-should-not-exist-' + Date.now(), $());
+    var r = call('write', { action: 'download_file', args: { library: '11111111-1111-1111-1111-111111111111', path: '/notes.txt' } });
+    ok(r.saved !== link, 'did not use the symlink'); has(r.saved, 'notes (');
+    $.NSFileManager.defaultManager.removeItemAtPathError(link, $());
+  });
+  test('an empty text file can be written', function () {
+    call('write', { action: 'write_text_file', args: { library: '11111111-1111-1111-1111-111111111111', path: '/empty.txt', text: '' } });
+    eq(F.lib('Projects').items['/empty.txt'].content, '');
+  });
+  test('recoverability needs explicit evidence; replacing needs it too', function () {
+    var orig = http;
+    http = function (req) { if (/history-limit/.test(req.url)) return { status: 200, json: {}, text: '{}' }; return orig(req); };
+    has(callErr('write', { action: 'delete', args: { library: '11111111-1111-1111-1111-111111111111', paths: ['/notes.txt'] } }), 'could not be confirmed');
+    http = orig;
+    has(callErr('write', { action: 'write_text_file', args: { library: 'Scratch', path: '/tmp.txt', text: 'y', replace: true } }), 'keeps no file history');
+  });
+  test('move/copy/delete: root, duplicates and a folder with its own content are refused', function () {
+    var L = '11111111-1111-1111-1111-111111111111';
+    has(callErr('write', { action: 'move', args: { library: L, paths: ['/'], to_folder: '/Archive' } }), 'root');
+    has(callErr('write', { action: 'copy', args: { library: L, paths: ['/notes.txt', '/notes.txt'], to_folder: '/Archive' } }), 'listed twice');
+    has(callErr('write', { action: 'delete', args: { library: L, paths: ['/2026', '/2026/plan.md'] } }), 'is inside /2026');
+  });
+  test('restore with several deleted versions asks for commit_id', function () {
+    var L = F.lib('Projects');
+    L.trash.push({ parent_dir: '/', obj_name: 'gone.txt', full: '/gone.txt', commit_id: 'c1', deleted_time: 't1', item: { type: 'file', content: '1' } });
+    L.trash.push({ parent_dir: '/', obj_name: 'gone.txt', full: '/gone.txt', commit_id: 'c2', deleted_time: 't2', item: { type: 'file', content: '2' } });
+    has(callErr('write', { action: 'restore', args: { library: L.id, path: '/gone.txt' } }), 'commit_id');
+  });
+  test('share links expire in 30 days unless told otherwise', function () {
+    var L = '11111111-1111-1111-1111-111111111111';
+    eq(call('write', { action: 'create_share_link', args: { library: L, path: '/notes.txt', dry_run: true } }).expire_days, 30);
+    eq(call('write', { action: 'create_share_link', args: { library: L, path: '/notes.txt', expire_days: 0, dry_run: true } }).expire_days, 'never');
+  });
+
   test('tool text is compact, English, every action listed', function () {
     PUBLIC_TOOLS.forEach(function (t) { ok(!/[А-Яа-яЁё]/.test(t.description)); actionsOf(t.name).forEach(function (n) { has(t.description, '• ' + n + '('); }); });
     ok(JSON.stringify(PUBLIC_TOOLS).length < 7000, 'catalog ' + JSON.stringify(PUBLIC_TOOLS).length);
