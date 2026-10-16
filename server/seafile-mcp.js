@@ -169,7 +169,7 @@ function coerce(v, spec, key, strict) {
     case 'string': {
       if (typeof v === 'number' || typeof v === 'boolean') v = String(v);
       if (typeof v !== 'string') bad('text');
-      var s = trim(v);
+      var s = spec.raw ? v : trim(v); // content (raw) is kept byte for byte; names and ids are trimmed
       if (!spec.values) return s;
       var hit = pickName(s, spec.values) || (spec.valueAliases || {})[lower(s)] || (spec.valueAliases || {})[snake(s)];
       if (!hit && !strict) { var c = closest(s, spec.values); if (c.length) { hit = c[0]; note('Read ' + key + ' "' + s + '" as "' + hit + '".'); } }
@@ -748,7 +748,7 @@ var ACTIONS = {
   upload_file: { tool: 'write', guard: true, desc: 'Upload a local file (only from the local folder in the settings). replace:true makes a new version.',
     args: { library: LIB, file: { type: 'string', required: true, desc: 'local file, inside the local folder' }, to_folder: { type: 'string', 'default': '/', aliases: ['folder', 'dir', 'path', 'remote_path', 'into', 'to'] }, replace: { type: 'boolean', 'default': false }, dry_run: DRY }, run: SEAFILE.upload_file },
   write_text_file: { tool: 'write', guard: true, desc: 'Create a text file from text; replace:true saves a new version of an existing one.',
-    args: { library: LIB, path: { type: 'string', required: true }, text: { type: 'string', required: true }, replace: { type: 'boolean', 'default': false }, dry_run: DRY }, run: SEAFILE.write_text_file },
+    args: { library: LIB, path: { type: 'string', required: true }, text: { type: 'string', required: true, raw: true }, replace: { type: 'boolean', 'default': false }, dry_run: DRY }, run: SEAFILE.write_text_file },
   create_folder: { tool: 'write', guard: true, desc: 'Create a folder (and missing parents).', args: { library: LIB, path: { type: 'string', required: true } }, run: SEAFILE.create_folder },
   rename: { tool: 'write', guard: true, desc: 'Rename a file or folder in place.', args: { library: LIB, path: { type: 'string', required: true }, new_name: { type: 'string', required: true } }, run: SEAFILE.rename },
   move: { tool: 'write', guard: true, desc: 'Move files/folders to another folder (or library).',

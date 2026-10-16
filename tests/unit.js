@@ -188,6 +188,10 @@ function run(argv) {
     ok(a.saved !== b.saved, 'second copy got a new name'); ok(a.saved.indexOf(LOCAL + '/') === 0 && b.saved.indexOf(LOCAL + '/') === 0, 'inside the local folder');
     has(callErr('write', { action: 'download_file', args: { library: L, path: '/notes.txt', to: '/etc' } }), 'only inside');
   });
+  test('write_text_file keeps the text byte for byte', function () {
+    call('write', { action: 'write_text_file', args: { library: '11111111-1111-1111-1111-111111111111', path: '/raw.md', text: '  indented\nlast line\n\n' } });
+    eq(F.lib('Projects').items['/raw.md'].content, '  indented\nlast line\n\n');
+  });
   test('write_text_file creates; replacing needs replace:true', function () {
     var L = '11111111-1111-1111-1111-111111111111';
     call('write', { action: 'write_text_file', args: { library: L, path: '/2026/todo.md', text: '- a' } });
