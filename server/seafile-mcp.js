@@ -481,7 +481,7 @@ var SEAFILE = {
     if (token && !a.again) {
       SESSION = { server: server, token: token, user: null };
       var me = api('GET', '/api2/account/info/');
-      return { signed_in: true, server: server, user: me.email, name: me.name };
+      return { signed_in: true, server: server, user: me.contact_email || me.login_id || me.email, name: me.name };
     }
     if (a.again) secretDelete(server);
     var s = signIn(server);
@@ -489,7 +489,7 @@ var SEAFILE = {
   },
   status: function () {
     var s = session(), me = api('GET', '/api2/account/info/');
-    return { server: s.server, user: me.email, name: me.name, quota_bytes: me.total > 0 ? me.total : null, used_bytes: me.usage, used: me.space_usage };
+    return { server: s.server, user: me.contact_email || me.login_id || me.email, name: me.name, quota_bytes: me.total > 0 ? me.total : null, used_bytes: me.usage, used: me.space_usage };
   },
   list_libraries: function (a) {
     var list = libraries().filter(function (l) { return !a.type || l.type === a.type; });
