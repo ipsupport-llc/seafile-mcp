@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "seafile-mcp",
   "display_name": "Seafile",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Your Seafile files for your AI assistant — libraries, folders, search, read, upload, share links. Browser sign-in, no dependencies.",
   "long_description": "Runs on JavaScript for Automation (osascript), which ships with macOS: no Node, Python or Homebrew. Signs in through the browser like the Seafile desktop client (password, SSO, two-factor — whatever your server uses); the token is kept in the macOS Keychain. Two tools — `read` (never changes anything) and `write` (upload, move, delete to trash, share) — so you approve permissions twice, not thirty times.",
   "author": {
