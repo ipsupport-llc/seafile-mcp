@@ -11,7 +11,7 @@
 
 ObjC.import('Foundation');
 
-var VERSION = '0.1.0'; // release.yml rewrites this from the tag
+var VERSION = '0.1.1'; // release.yml rewrites this from the tag
 
 // ---------- IO ----------
 var stdout = $.NSFileHandle.fileHandleWithStandardOutput;
@@ -597,14 +597,22 @@ var SEAFILE = {
     var lib = library(a.library), p = cleanPath(a.path), e = mustExist(lib, p);
     if (e.type === 'dir') fail(p + ' is a folder; only files can be downloaded here.');
     notEncrypted(lib, 'downloading');
-    var dir = insideLocal(a.to, LOCAL_DIR, 'Files are saved');
+    // "to" is a subfolder; a value that looks like a file name ("report.pdf", "sub/report.pdf") is read as the name to save under
+    var to = a.to, asName = null;
+    if (to && /\.[A-Za-z0-9]{1,8}$/.test(to) && !/\/$/.test(to)) {
+      var cut = to.replace(/\\/g, '/').lastIndexOf('/');
+      asName = to.slice(cut + 1); to = cut > 0 ? to.slice(0, cut) : null;
+      note('Read "' + a.to + '" as the file name to save under' + (to ? ', in the subfolder "' + to + '"' : '') + '.');
+    }
+    var dir = insideLocal(to, LOCAL_DIR, 'Files are saved');
     if (!$.NSFileManager.defaultManager.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(dir, true, $(), $())) fail('Could not create ' + dir + '.');
     var url = serverURL(api('GET', '/api2/repos/' + lib.id + '/file/', { query: { p: p } }), 'download'), tmp = privateTemp('download');
     checkCancelled();
     var r = http({ url: url, out: tmp, timeout: CALL_TIMEOUT_S - 2 });
     if (r.status !== 200) { removeQuietly(tmp); fail('Could not download ' + p + (r.status ? ' (HTTP ' + r.status + ')' : r.curl === 28 ? ' in time' : '') + '.'); }
-    var target = placeWithoutReplacing(tmp, dir, baseName(p));
-    return { saved: target, size: e.size, from: lib.name + ':' + p };
+    var target = placeWithoutReplacing(tmp, dir, asName || baseName(p)), rel = target.slice(LOCAL_DIR.length + 1);
+    note('Saved as "' + rel + '" in ' + LOCAL_DIR + '. Another tool (e.g. email) can use it from there by that name — for an email attachment pass attachments: ["' + rel + '"].');
+    return { saved: target, name: rel, size: e.size, from: lib.name + ':' + p };
   },
   upload_file: function (a) {
     var lib = library(a.library), dir = cleanPath(a.to_folder), local = insideLocal(a.file, LOCAL_DIR, 'Files can be uploaded');
@@ -832,7 +840,7 @@ var ACTIONS = {
   list_share_links: { tool: 'read', desc: 'Your share links, optionally for one library/path.', args: { library: { type: 'string' }, path: { type: 'string' }, limit: LIMIT(50, 200) }, run: SEAFILE.list_share_links },
 
   download_file: { tool: 'write', guard: true, desc: 'Save a file into the local folder from the settings (default ~/Downloads). Never overwrites.',
-    args: { library: LIB, path: { type: 'string', required: true }, to: { type: 'string', desc: 'subfolder of the local folder' } }, run: SEAFILE.download_file },
+    args: { library: LIB, path: { type: 'string', required: true }, to: { type: 'string', desc: 'subfolder of the local folder, or a file name to save as' } }, run: SEAFILE.download_file },
   upload_file: { tool: 'write', guard: true, desc: 'Upload a local file (only from the local folder in the settings). replace:true makes a new version.',
     args: { library: LIB, file: { type: 'string', required: true, desc: 'local file, inside the local folder' }, to_folder: { type: 'string', 'default': '/', aliases: ['folder', 'dir', 'path', 'remote_path', 'into', 'to'] }, replace: { type: 'boolean', 'default': false }, dry_run: DRY }, run: SEAFILE.upload_file },
   write_text_file: { tool: 'write', guard: true, desc: 'Create a text file from text; replace:true saves a new version of an existing one.',

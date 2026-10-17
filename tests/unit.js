@@ -199,6 +199,12 @@ function run(argv) {
     ok(F.lib('Projects').items['/say "hi".md'], 'stored with real quotes: ' + Object.keys(F.lib('Projects').items).join(', '));
     has(callErr('write', { action: 'rename', args: { library: L, path: '/notes.txt', new_name: 'a\\b.txt' } }), 'backslash');
   });
+  test('download_file: "to" that looks like a file name is the name to save as; the result says how to attach it', function () {
+    var r = call('write', { action: 'download_file', args: { library: '11111111-1111-1111-1111-111111111111', path: '/notes.txt', to: 'memo.txt' } });
+    eq(r.name, 'memo.txt'); has(r.notes.join(' '), 'attachments: ["memo.txt"]');
+    var s2 = call('write', { action: 'download_file', args: { library: '11111111-1111-1111-1111-111111111111', path: '/notes.txt', to: 'inbox' } });
+    eq(s2.name, 'inbox/notes.txt');
+  });
   test('write_text_file keeps the text byte for byte', function () {
     call('write', { action: 'write_text_file', args: { library: '11111111-1111-1111-1111-111111111111', path: '/raw.md', text: '  indented\nlast line\n\n' } });
     eq(F.lib('Projects').items['/raw.md'].content, '  indented\nlast line\n\n');
